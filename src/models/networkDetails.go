@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,13 @@ type NetTickMsg struct {
 	timestamp time.Time
 }
 
+type SpeedtestMsg struct {
+	Id       int
+	Download float64
+}
+
+type SpeedtestTriggerMsg int
+
 type NetworkModel struct {
 	Id           int
 	Interface    string
@@ -36,6 +44,10 @@ type NetworkModel struct {
 	lastCheck     time.Time
 
 	Polling bool
+
+	SpeedtestDownload float64
+	SpeedtestTime     string
+	IsSpeedtesting    bool
 }
 
 func NewNetworkModel() NetworkModel {
@@ -101,13 +113,37 @@ func (m NetworkModel) Init() tea.Cmd {
 			}
 		}
 		m.lastCheck = time.Now()
-		return getNetworkTick(m.Id, m.Interface)
+		m.IsSpeedtesting = true
+		return tea.Batch(
+			getNetworkTick(m.Id, m.Interface),
+			runSpeedtest(m.Id),
+		)
 	}
 	return nil
 }
 
 func (m NetworkModel) Update(msg tea.Msg) (NetworkModel, tea.Cmd) {
 	switch msg := msg.(type) {
+	case SpeedtestMsg:
+		if msg.Id != m.Id {
+			return m, nil
+		}
+		m.SpeedtestDownload = msg.Download
+		m.SpeedtestTime = time.Now().Format("15:04")
+		m.IsSpeedtesting = false
+		// Schedule next one in 5 minutes
+		return m, tea.Tick(5*time.Minute, func(t time.Time) tea.Msg {
+			return SpeedtestTriggerMsg(m.Id)
+		})
+	case SpeedtestTriggerMsg:
+		if int(msg) != m.Id {
+			return m, nil
+		}
+		if !m.Polling {
+			return m, nil
+		}
+		m.IsSpeedtesting = true
+		return m, runSpeedtest(m.Id)
 	case NetTickMsg:
 		if msg.id != m.Id {
 			return m, nil
@@ -156,12 +192,33 @@ func (m NetworkModel) View() string {
 		"",
 		styles.RenderStat(" Total Rx:", formatSize(m.lastBytesRecv)),
 		styles.RenderStat(" Total Tx:", formatSize(m.lastBytesSent)),
+		"",
+		m.renderSpeedtestSection(),
 	)
 
 	box := styles.StatBoxStyle.Render(content)
 	// help := styles.HelpStyle.Render("[Space] Return to Menu")
 
 	return lipgloss.JoinVertical(lipgloss.Left, title, box)
+}
+
+func (m NetworkModel) renderSpeedtestSection() string {
+	if m.IsSpeedtesting {
+		return styles.StatKeyStyle.Render("󰾆 Speedtest: Running...")
+	}
+	if m.SpeedtestTime == "" {
+		return styles.StatKeyStyle.Render("󰾆 Speedtest: Waiting...")
+	}
+
+	val := fmt.Sprintf("%.2f Mbps", m.SpeedtestDownload)
+	timeStr := fmt.Sprintf("(at %s)", m.SpeedtestTime)
+
+	return lipgloss.JoinHorizontal(lipgloss.Left,
+		styles.StatKeyStyle.Render("󰾆 Speedtest:"),
+		styles.StatValueStyle.Foreground(styles.ColorCyan).Render(val),
+		" ",
+		styles.HelpStyle.Margin(0, 0).Render(timeStr),
+	)
 }
 
 func formatSpeed(bytesPerSec float64) string {
@@ -207,5 +264,31 @@ func collectNetworkData(id int, iface string) tea.Msg {
 		bytesRecv: recv,
 		bytesSent: sent,
 		timestamp: time.Now(),
+	}
+}
+
+func runSpeedtest(id int) tea.Cmd {
+	return func() tea.Msg {
+		// speedtest-cli --csv
+		out, err := exec.Command("speedtest-cli", "--csv", "--no-upload", "--server", "17391").Output()
+		if err != nil {
+			return SpeedtestMsg{Id: id, Download: 0}
+		}
+
+		fields := strings.Split(string(out), ",")
+		if len(fields) < 7 {
+			return SpeedtestMsg{Id: id, Download: 0}
+		}
+
+		// Download speed is 7th field in bits/s
+		downloadBits, err := strconv.ParseFloat(strings.TrimSpace(fields[6]), 64)
+		if err != nil {
+			return SpeedtestMsg{Id: id, Download: 0}
+		}
+
+		return SpeedtestMsg{
+			Id:       id,
+			Download: downloadBits / 1000000.0, // convert to Mbps
+		}
 	}
 }
